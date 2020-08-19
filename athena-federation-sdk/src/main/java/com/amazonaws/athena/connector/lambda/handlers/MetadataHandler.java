@@ -33,6 +33,7 @@ import com.amazonaws.athena.connector.lambda.data.SupportedTypes;
 import com.amazonaws.athena.connector.lambda.domain.predicate.ConstraintEvaluator;
 import com.amazonaws.athena.connector.lambda.domain.spill.S3SpillLocation;
 import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocation;
+import com.amazonaws.athena.connector.lambda.domain.spill.SpillLocationVerifier;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsRequest;
 import com.amazonaws.athena.connector.lambda.metadata.GetSplitsResponse;
 import com.amazonaws.athena.connector.lambda.metadata.GetTableLayoutRequest;
@@ -54,12 +55,13 @@ import com.amazonaws.athena.connector.lambda.security.EncryptionKey;
 import com.amazonaws.athena.connector.lambda.security.EncryptionKeyFactory;
 import com.amazonaws.athena.connector.lambda.security.KmsKeyFactory;
 import com.amazonaws.athena.connector.lambda.security.LocalKeyFactory;
-import com.amazonaws.athena.connector.lambda.serde.ObjectMapperFactory;
+import com.amazonaws.athena.connector.lambda.serde.VersionedObjectMapperFactory;
 import com.amazonaws.services.athena.AmazonAthena;
 import com.amazonaws.services.athena.AmazonAthenaClientBuilder;
 import com.amazonaws.services.kms.AWSKMSClientBuilder;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestStreamHandler;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.secretsmanager.AWSSecretsManager;
 import com.amazonaws.services.secretsmanager.AWSSecretsManagerClientBuilder;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -76,6 +78,7 @@ import java.util.UUID;
 
 import static com.amazonaws.athena.connector.lambda.handlers.AthenaExceptionFilter.ATHENA_EXCEPTION_FILTER;
 import static com.amazonaws.athena.connector.lambda.handlers.FederationCapabilities.CAPABILITIES;
+import static com.amazonaws.athena.connector.lambda.handlers.SerDeVersion.SERDE_VERSION;
 
 /**
  * This class defines the functionality required by any valid source of federated metadata for Athena. It is recommended
@@ -114,6 +117,7 @@ public abstract class MetadataHandler
     private final String spillBucket;
     private final String spillPrefix;
     private final String sourceType;
+    private final SpillLocationVerifier verifier;
 
     /**
      * @param sourceType Used to aid in logging diagnostic info when raising a support case.
@@ -136,6 +140,7 @@ public abstract class MetadataHandler
 
         this.secretsManager = new CachableSecretsManager(AWSSecretsManagerClientBuilder.defaultClient());
         this.athena = AmazonAthenaClientBuilder.defaultClient();
+        this.verifier = new SpillLocationVerifier(AmazonS3ClientBuilder.standard().build());
     }
 
     /**
@@ -154,6 +159,7 @@ public abstract class MetadataHandler
         this.sourceType = sourceType;
         this.spillBucket = spillBucket;
         this.spillPrefix = spillPrefix;
+        this.verifier = new SpillLocationVerifier(AmazonS3ClientBuilder.standard().build());
     }
 
     /**
@@ -195,7 +201,7 @@ public abstract class MetadataHandler
             throws IOException
     {
         try (BlockAllocator allocator = new BlockAllocatorImpl()) {
-            ObjectMapper objectMapper = ObjectMapperFactory.create(allocator);
+            ObjectMapper objectMapper = VersionedObjectMapperFactory.create(allocator);
             try (FederationRequest rawReq = objectMapper.readValue(inputStream, FederationRequest.class)) {
                 if (rawReq instanceof PingRequest) {
                     try (PingResponse response = doPing((PingRequest) rawReq)) {
@@ -256,6 +262,7 @@ public abstract class MetadataHandler
                 }
                 return;
             case GET_SPLITS:
+                verifier.checkBucketAuthZ(spillBucket);
                 try (GetSplitsResponse response = doGetSplits(allocator, (GetSplitsRequest) req)) {
                     logger.info("doHandleRequest: response[{}]", response);
                     assertNotNull(response);
@@ -425,7 +432,7 @@ public abstract class MetadataHandler
      */
     public PingResponse doPing(PingRequest request)
     {
-        PingResponse response = new PingResponse(request.getCatalogName(), request.getQueryId(), sourceType, CAPABILITIES);
+        PingResponse response = new PingResponse(request.getCatalogName(), request.getQueryId(), sourceType, CAPABILITIES, SERDE_VERSION);
         try {
             onPing(request);
         }
